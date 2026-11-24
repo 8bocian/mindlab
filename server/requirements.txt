@@ -1,0 +1,7 @@
+# torch is installed separately by setup_vm.sh (matching your GPU driver)
+transformers>=5.0
+accelerate>=1.0
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2
+huggingface_hub[hf_xet]>=0.30

@@ -1,0 +1,19 @@
+[project]
+name = "mindlab"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "oskar", email = "oskar.mozdzen@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "paramiko>=5.1.0",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+mindlab = "mindlab:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
