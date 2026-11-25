@@ -65,7 +65,8 @@ def load_cfg(path: pathlib.Path) -> dict:
                     VM_NAME="mindlab", PRICE_PER_HOUR="0", END_ACTION="hibernate", WATCHDOG="1",
                     IDLE_MINUTES="30", MAX_HOURS="8", MODEL="Qwen/Qwen3-8B", DTYPE="auto",
                     TRUST_REMOTE_CODE="0", LOCAL_PORT="8000", CLOUDFLARE_TUNNEL_TOKEN="", ACCESS_PASSWORD="",
-                    ALLOWED_ORIGINS="*", PUBLIC_URL="", MAX_NEW_TOKENS_CAP="400")
+                    ALLOWED_ORIGINS="*", PUBLIC_URL="", MAX_NEW_TOKENS_CAP="400", GPU_FALLBACK="",
+                    DELETE_OLD_ON_FALLBACK="1")
     for k, v in defaults.items():
         if not cfg.get(k):
             cfg[k] = v
@@ -73,6 +74,8 @@ def load_cfg(path: pathlib.Path) -> dict:
         sys.exit("Uzupełnij HYPERSTACK_API_KEY w lab.env")
     for k in ("SSH_PRIVATE_KEY", "SSH_PUBLIC_KEY"):
         cfg[k] = str(pathlib.Path(cfg[k]).expanduser())
+    # GPUs to try, in order: GPU_FALLBACK (comma list) or just GPU_MATCH
+    cfg["GPU_LIST"] = [g.strip() for g in (cfg["GPU_FALLBACK"] or cfg["GPU_MATCH"]).split(",") if g.strip()]
     return cfg
 
 
@@ -173,16 +176,31 @@ def find_env(hs, cfg):
     sys.exit(f"Nie znaleziono environment '{cfg['ENVIRONMENT']}'. Dostępne: {names}")
 
 
+def our_vms(hs, cfg):
+    """All live MindLab VMs: named VM_NAME, or VM_NAME-<gpu> (created on a fallback GPU)."""
+    base = cfg["VM_NAME"]
+    return [v for v in hs.vms(base)
+            if (v.get("name") == base or (v.get("name") or "").startswith(base + "-"))
+            and status_of(v) not in ("DELETED", "DELETING")]
+
+
 def find_vm(hs, cfg):
-    for v in hs.vms(cfg["VM_NAME"]):
-        if v.get("name") == cfg["VM_NAME"] and status_of(v) not in ("DELETED", "DELETING"):
-            return v
-    return None
+    """The VM to use: a running one first, else the newest."""
+    vms = our_vms(hs, cfg)
+    if not vms:
+        return None
+    vms.sort(key=lambda v: (status_of(v) == "ACTIVE", v.get("created_at") or "", v.get("id") or 0), reverse=True)
+    return vms[0]
 
 
-def flavor_matches(f, cfg):
-    """GPU name contains GPU_MATCH, right GPU count; spot (interruptible) only if GPU_MATCH asks for it."""
-    m = norm(cfg["GPU_MATCH"])
+def is_stock_error(e: Exception) -> bool:
+    return "stock" in str(e).lower()
+
+
+def flavor_matches(f, cfg, match=None):
+    """GPU name contains the pattern (default GPU_MATCH), right GPU count; spot (interruptible) only
+    if the pattern asks for it."""
+    m = norm(match if match is not None else cfg["GPU_MATCH"])
     want_spot = "spot" in m
     m = m.replace("spot", "")
     is_spot = "spot" in norm(f.get("name")) + norm(f.get("gpu"))
@@ -191,22 +209,28 @@ def flavor_matches(f, cfg):
     return (m in norm(f.get("gpu")) or m in norm(f.get("name"))) and int(f.get("gpu_count") or 0) == int(cfg["GPU_COUNT"])
 
 
-def pick_flavor(hs, cfg, region):
+def pick_flavors(hs, cfg, region):
+    """In-stock flavors to try, in GPU_LIST order (smallest RAM first within one GPU type)."""
     fl = hs.flavors(region)
     if cfg["FLAVOR_NAME"]:
         for f in fl:
             if f.get("name") == cfg["FLAVOR_NAME"]:
-                return f, fl
+                return [f]
         sys.exit(f"Flavor {cfg['FLAVOR_NAME']} nie istnieje w regionie {region}. Uruchom: python lab.py check")
-    m = norm(cfg["GPU_MATCH"])
-    cands = [f for f in fl if flavor_matches(f, cfg)]
-    in_stock = [f for f in cands if f.get("stock_available")]
-    if in_stock:
-        return sorted(in_stock, key=lambda f: (f.get("ram") or 0))[0], fl
-    if cands:
-        sys.exit(f"GPU {cfg['GPU_MATCH']} x{cfg['GPU_COUNT']} istnieje w {region}, ale chwilowo brak dostępności. "
-                 "Spróbuj później, inny region (ENVIRONMENT) albo inne GPU (GPU_MATCH).")
-    sys.exit(f"Brak GPU pasującego do '{cfg['GPU_MATCH']}' x{cfg['GPU_COUNT']} w {region}. Uruchom: python lab.py check")
+    out, known = [], False
+    for pat in cfg["GPU_LIST"]:
+        cands = [f for f in fl if flavor_matches(f, cfg, pat)]
+        known |= bool(cands)
+        # smallest RAM, then smallest disk ("bigroot" variants have a huge, pricier disk)
+        out += sorted([f for f in cands if f.get("stock_available") and f not in out],
+                      key=lambda f: (f.get("ram") or 0, f.get("disk") or 0))
+    if out:
+        return out
+    gpus = ", ".join(cfg["GPU_LIST"])
+    if known:
+        sys.exit(f"Żadne z GPU ({gpus}) x{cfg['GPU_COUNT']} nie jest teraz dostępne w {region}. "
+                 "Spróbuj później albo dopisz inne GPU do GPU_FALLBACK (lista: python lab.py check).")
+    sys.exit(f"Brak GPU pasującego do ({gpus}) x{cfg['GPU_COUNT']} w {region}. Uruchom: python lab.py check")
 
 
 def pick_image(hs, cfg, region):
@@ -443,33 +467,78 @@ def cmd_up(hs, cfg, keep=False, detach=False):
     env = find_env(hs, cfg)
     region = env.get("region")
     vm = find_vm(hs, cfg)
+    old_vm = None            # hibernated VM that could not be restored (no stock): deleted once the new one works
     if vm:
         st = status_of(vm)
-        say(f"znaleziono VM '{cfg['VM_NAME']}' (id {vm['id']}) w stanie {st}")
-        if st == "HIBERNATED":
-            say("wybudzam z hibernacji…")
-            hs.restore(vm["id"])
-        elif st in ("SHUTOFF", "STOPPED"):
-            say("uruchamiam…")
-            hs.start(vm["id"])
-        vm_id = vm["id"]
-    else:
+        say(f"znaleziono VM '{vm['name']}' (id {vm['id']}) w stanie {st}")
+        if st == "HIBERNATING":
+            say("VM jeszcze hibernuje - czekam, aż skończy (nie da się tego przerwać)…")
+            while status_of(vm) == "HIBERNATING":
+                time.sleep(15)
+                vm = hs.vm(vm["id"])
+            st = status_of(vm)
+        try:
+            if st == "HIBERNATED":
+                say("wybudzam z hibernacji…")
+                hs.restore(vm["id"])
+            elif st in ("SHUTOFF", "STOPPED"):
+                say("uruchamiam…")
+                hs.start(vm["id"])
+            vm_id = vm["id"]
+        except HSError as e:
+            if not is_stock_error(e):
+                raise
+            warn(f"nie da się wybudzić '{vm['name']}': brak wolnych kart {(vm.get('flavor') or {}).get('name')}. "
+                 "Tworzę nową VM na pierwszej dostępnej karcie z listy (pełna instalacja, ok. 10-15 min).")
+            old_vm, vm = vm, None
+    if not vm:
         ensure_keypair(hs, cfg)
-        flavor, _ = pick_flavor(hs, cfg, region)
         image, _ = pick_image(hs, cfg, region)
-        say(f"tworzę VM: {flavor.get('name')} ({flavor.get('gpu')} x{flavor.get('gpu_count')}, "
-            f"{flavor.get('ram')} GB RAM, dysk {flavor.get('disk')} GB) · obraz: {image.get('name')}")
-        payload = {
-            "name": cfg["VM_NAME"], "environment_name": cfg["ENVIRONMENT"], "flavor_name": flavor["name"],
-            "image_name": image["name"], "key_name": cfg["KEYPAIR_NAME"], "count": 1,
-            "assign_floating_ip": True, "labels": ["mindlab"],
-            "security_rules": [{"direction": "ingress", "ethertype": "IPv4", "protocol": "tcp",
-                                "remote_ip_prefix": cfg["SSH_ALLOW_CIDR"], "port_range_min": 22, "port_range_max": 22}],
-        }
-        inst = hs.create_vm(payload)
-        if not inst:
-            sys.exit("API nie zwróciło utworzonej VM - sprawdź panel")
-        vm_id = inst[0]["id"]
+        vm_id = None
+        for flavor in pick_flavors(hs, cfg, region):
+            if old_vm is None:
+                name = cfg["VM_NAME"]
+            else:
+                name = f"{cfg['VM_NAME']}-{norm(flavor.get('gpu'))[:20]}"
+                if name == old_vm.get("name"):
+                    name += "-2"
+            say(f"tworzę VM '{name}': {flavor.get('name')} ({flavor.get('gpu')} x{flavor.get('gpu_count')}, "
+                f"{flavor.get('ram')} GB RAM, dysk {flavor.get('disk')} GB) · obraz: {image.get('name')}")
+            payload = {
+                "name": name, "environment_name": cfg["ENVIRONMENT"], "flavor_name": flavor["name"],
+                "image_name": image["name"], "key_name": cfg["KEYPAIR_NAME"], "count": 1,
+                "assign_floating_ip": True, "labels": ["mindlab"],
+                "security_rules": [{"direction": "ingress", "ethertype": "IPv4", "protocol": "tcp",
+                                    "remote_ip_prefix": cfg["SSH_ALLOW_CIDR"], "port_range_min": 22, "port_range_max": 22}],
+            }
+            try:
+                inst = hs.create_vm(payload)
+            except HSError as e:
+                if is_stock_error(e):          # the stock flag can be stale: try the next GPU
+                    warn(f"{flavor.get('name')}: brak dostępności mimo flagi - próbuję następną kartę")
+                    continue
+                raise
+            if not inst:
+                sys.exit("API nie zwróciło utworzonej VM - sprawdź panel")
+            vm_id = inst[0]["id"]
+            break
+        if vm_id is None:
+            sys.exit(f"Żadna karta z listy ({', '.join(cfg['GPU_LIST'])}) nie jest teraz dostępna. Spróbuj później.")
+
+    def drop_old_vm():
+        """After the new VM works: remove the hibernated one we could not restore (only reproducible state)."""
+        if not old_vm:
+            return
+        if cfg["DELETE_OLD_ON_FALLBACK"] == "1":
+            try:
+                hs.delete_vm(old_vm["id"])
+                say(f"usunięto starą VM '{old_vm['name']}' (id {old_vm['id']}), której nie dało się wybudzić - "
+                    "nie płacisz już za jej dysk.", "32")
+            except HSError as e:
+                warn(f"nie udało się usunąć starej VM '{old_vm['name']}' ({e}) - usuń ją w panelu, płaci za dysk.")
+        else:
+            warn(f"stara VM '{old_vm['name']}' (id {old_vm['id']}) nadal istnieje i płaci za dysk - usuń ją w panelu.")
+
     t_start = time.time()
     tunnel = None
     try:
@@ -509,6 +578,7 @@ def cmd_up(hs, cfg, keep=False, detach=False):
                 last = prog
                 say(f"  {last}")
             time.sleep(5)
+        drop_old_vm()
         if detach:
             say("GOTOWE. Serwer działa publicznie przez tunel Cloudflare.", "32")
             if cfg["PUBLIC_URL"]:
@@ -571,22 +641,24 @@ def cmd_check(hs, cfg):
     for f in sorted(hs.flavors(region), key=lambda f: (str(f.get("gpu")), f.get("gpu_count") or 0)):
         if not f.get("gpu"):
             continue
-        mark = "←" if flavor_matches(f, cfg) else " "
+        hit = [k for k, pat in enumerate(cfg["GPU_LIST"], 1) if flavor_matches(f, cfg, pat)]
+        mark = str(hit[0]) if hit else " "
         print(f" {mark} {f.get('name'):<32} {f.get('gpu')} x{f.get('gpu_count')}  RAM {f.get('ram')} GB  dysk {f.get('disk')} GB  "
               f"{'dostępny' if f.get('stock_available') else 'brak'}")
     print(f"\nObrazy Ubuntu w {region} (IMAGE_NAME):")
     for i in hs.images(region):
         if "ubuntu" in (i.get("name") or "").lower():
             print(f"   {i.get('name')}")
+    print("   (cyfra = pozycja na liście GPU_FALLBACK / GPU_MATCH)")
     try:
-        f, _ = pick_flavor(hs, cfg, region)
+        f = pick_flavors(hs, cfg, region)[0]
         i, _ = pick_image(hs, cfg, region)
-        say(f"wybór automatyczny: {f.get('name')} + {i.get('name')}", "32")
+        say(f"wybór dla nowej VM: {f.get('name')} + {i.get('name')}", "32")
     except SystemExit as e:
         warn(str(e))
-    vm = find_vm(hs, cfg)
-    if vm:
-        say(f"istniejąca VM '{cfg['VM_NAME']}': id {vm.get('id')}, stan {status_of(vm)}, IP {vm.get('floating_ip')}")
+    for vm in our_vms(hs, cfg):
+        say(f"istniejąca VM '{vm.get('name')}': id {vm.get('id')}, stan {status_of(vm)}, "
+            f"karta {(vm.get('flavor') or {}).get('name')}, IP {vm.get('floating_ip')}")
 
 
 def main():
