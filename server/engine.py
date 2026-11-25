@@ -55,6 +55,9 @@ class Concept:
 
 
 class Engine:
+    Z_MAX = 10.0        # target mode: slider 1.0 = push the concept to z = Z_MAX above neutral background
+    MAX_EXAMPLES = 64   # contrast concepts: per list
+
     def __init__(self, model_id: str, dtype: str = "auto", device_map: str = "auto",
                  trust_remote_code: bool = False, layers_path: str | None = None,
                  norm_path: str | None = None):
@@ -125,6 +128,8 @@ class Engine:
         self._rec: dict[Site, torch.Tensor] = {}
         self.steer_on = False
         self._delta: dict[Site, torch.Tensor] = {}
+        # target mode: site -> [(unit, target projection, push_up)]; clamps instead of adding
+        self._targets: dict[Site, list[tuple[torch.Tensor, float, bool]]] = {}
         self.steer_prompt = True        # also steer prompt positions
         self._in_prompt = False
         self._handles = [self.model.register_forward_pre_hook(self._reset_hook)]
@@ -210,8 +215,19 @@ class Engine:
             if site not in self._order:
                 self._order[site] = (len(self._order),)
             changed = False
-            if self.steer_on and site in self._delta and (self.steer_prompt or not self._in_prompt):
+            active = self.steer_on and (self.steer_prompt or not self._in_prompt)
+            if active and site in self._delta:
                 h = h + self._delta[site].to(h.dtype)
+                changed = True
+            if active and site in self._targets:
+                # move the projection onto each concept up (or down) to its target, never past it:
+                # no overshoot no matter how strong the concept already is
+                hf = h.float()
+                for u, tgt, up in self._targets[site]:
+                    pr = hf @ u
+                    d = (tgt - pr).clamp(min=0) if up else (tgt - pr).clamp(max=0)
+                    hf = hf + d.unsqueeze(-1) * u
+                h = hf.to(h.dtype)
                 changed = True
             if self.recording:
                 self._rec[site] = h[:, -1, :].detach().float()
@@ -267,27 +283,44 @@ class Engine:
         return v[keep] if int(keep.sum()) >= max(2, len(v) // 2) else v
 
     # ------------------------------------------------------------------ concepts
-    def add_concept(self, name: str) -> Concept:
+    def add_concept(self, name: str, positive: list[str] | None = None,
+                    negative: list[str] | None = None) -> Concept:
+        """Without examples: template sentences with the word vs the neutral baseline.
+        With examples (contrast): mean(positive) - mean(negative) states, per site.
+        mu/sd/gap are always measured on the neutral baseline projections."""
         name = name.strip()
         if not name:
             raise ValueError("empty concept")
         if len(name) > 60:
             raise ValueError("concept name too long (max 60 chars)")
-        if name in self.concepts:          # shared library: computed once, reused by everyone
+        pos = [t.strip() for t in (positive or []) if t and t.strip()]
+        neg = [t.strip() for t in (negative or []) if t and t.strip()]
+        if bool(pos) != bool(neg):
+            raise ValueError("contrast needs both positive and negative examples")
+        if len(pos) > self.MAX_EXAMPLES or len(neg) > self.MAX_EXAMPLES:
+            raise ValueError(f"too many examples (max {self.MAX_EXAMPLES} per list)")
+        contrast = bool(pos)
+        # shared library: a plain concept is computed once and reused by everyone;
+        # a contrast concept is (re)computed from the examples it was sent with
+        if name in self.concepts and not contrast:
             return self.concepts[name]
-        if len(self.concepts) >= self.max_concepts:
+        if name not in self.concepts and len(self.concepts) >= self.max_concepts:
             raise ValueError(f"concept library full ({self.max_concepts})")
         with self.lock:
-            if name in self.concepts:
+            if name in self.concepts and not contrast:
                 return self.concepts[name]
             self.ensure_baseline()
-            st = self._last_states([t.format(name) for t in TEMPLATES])
+            if contrast:
+                st_pos, st_neg = self._last_states(pos), self._last_states(neg)
+            else:
+                st_pos, st_neg = self._last_states([t.format(name) for t in TEMPLATES]), None
             unit, mu, sd, gap = {}, {}, {}, {}
             for s in self.sites:
-                if s not in st:
+                if s not in st_pos or (contrast and s not in st_neg):
                     continue
-                cs = self._drop_outliers(st[s])
-                d = cs.mean(0) - self.base_mean[s]
+                cs = self._drop_outliers(st_pos[s])
+                ref = self._drop_outliers(st_neg[s]).mean(0) if contrast else self.base_mean[s]
+                d = cs.mean(0) - ref
                 u = d / (d.norm() + 1e-6)
                 unit[s] = u
                 proj_b = self.base_states[s] @ u
@@ -297,6 +330,17 @@ class Engine:
             c = Concept(name, unit, mu, sd, gap)
             self.concepts[name] = c
             return c
+
+    def concept_report(self, c: Concept) -> dict:
+        """Separation per site + suggested injection layers around the best middle layer."""
+        n = self.n_layers
+        lo_r = int(0.2 * n)
+        hi_r = max(int(0.6 * n), lo_r + 1)
+        mid = [s for s in self.sites if lo_r <= s[0] <= hi_r and s in c.gap] or [s for s in self.sites if s in c.gap]
+        best = max(mid, key=lambda s: c.gap[s])[0] if mid else n // 3
+        return {"name": c.name, "best_gap": round(max(c.gap.values(), default=0.0), 1),
+                "gap": [round(c.gap.get(s, 0.0), 2) for s in self.sites],
+                "suggest": [max(0, best - 1), min(n - 1, best + 1)]}
 
     def build_delta(self, weights: dict[str, float], layer_lo: int, layer_hi: int,
                     passes: list[int] | None) -> dict[Site, torch.Tensor]:
@@ -321,6 +365,36 @@ class Engine:
             if acc is not None:
                 delta[s] = acc
         return delta
+
+    def build_targets(self, weights: dict[str, float], layer_lo: int, layer_hi: int,
+                      passes: list[int] | None) -> dict[Site, list]:
+        """Target mode: alpha -> target z = alpha * Z_MAX above the neutral mean (negative: below)."""
+        targets: dict[Site, list] = {}
+        passes_set = set(passes) if passes else None
+        for s in self.sites:
+            l, p = s
+            if not (layer_lo <= l <= layer_hi):
+                continue
+            if passes_set is not None and p not in passes_set:
+                continue
+            for name, a in weights.items():
+                c = self.concepts.get(name)
+                if c is None or abs(a) < 1e-6 or s not in c.unit:
+                    continue
+                tgt = c.mu[s] + a * self.Z_MAX * c.sd[s]
+                targets.setdefault(s, []).append((c.unit[s], tgt, a > 0))
+        return targets
+
+    def build_steer(self, weights: dict[str, float], layer_lo: int, layer_hi: int,
+                    passes: list[int] | None, steer_prompt: bool = True, mode: str = "add") -> dict:
+        """Steering for ONE request (pass to generate(steer=...)). mode: "add" = constant
+        alpha * |h|_typical * unit; "target" = clamp the concept's projection to its target z."""
+        if mode == "target":
+            delta, targets = {}, self.build_targets(weights, layer_lo, layer_hi, passes)
+        else:
+            delta, targets = self.build_delta(weights, layer_lo, layer_hi, passes), {}
+        return {"delta": delta, "targets": targets, "prompt": bool(steer_prompt),
+                "sites": len(set(delta) | set(targets))}
 
     # ------------------------------------------------------------------ analysis
     def _analyze(self, read_site: Site | None, names: list[str] | None = None):
@@ -401,7 +475,7 @@ class Engine:
                  enable_thinking=None, read_site: Site | None = None,
                  on_token=None, should_stop=lambda: False,
                  steer: dict | None = None, concepts: list[str] | None = None):
-        """steer: {"delta": {site: tensor}, "prompt": bool}. Re-read before every token, so the
+        """steer: build_steer() result {"delta", "targets", "prompt"}. Re-read before every token, so the
         caller may swap steer["delta"] mid-generation (live sliders); it affects only this request.
         concepts: names to report z-scores for (default: whole library)."""
         steer = steer if steer is not None else {"delta": {}, "prompt": True}
@@ -416,7 +490,8 @@ class Engine:
                     if should_stop():
                         break
                     self._delta = steer.get("delta") or {}
-                    self.steer_on = bool(self._delta)
+                    self._targets = steer.get("targets") or {}
+                    self.steer_on = bool(self._delta or self._targets)
                     self.steer_prompt = bool(steer.get("prompt", True))
                     self.recording, self._rec = True, {}
                     self._in_prompt = step == 0
@@ -468,6 +543,7 @@ class Engine:
             finally:
                 self.steer_on = False
                 self._delta = {}
+                self._targets = {}
 
     @staticmethod
     def _sample(logits, temperature, top_p):
@@ -489,5 +565,6 @@ class Engine:
             "max_passes": self.max_passes, "hidden": self.hidden,
             "layers_path": self.layers_name, "norm": type(self.norm).__name__,
             "sites": self.site_list(), "load_seconds": self.load_seconds,
-            "concepts": {n: {"best_gap": round(max(c.gap.values(), default=0), 1)} for n, c in list(self.concepts.items())},
+            "concepts": {n: self.concept_report(c) for n, c in list(self.concepts.items())},
+            "z_max": self.Z_MAX,
         }

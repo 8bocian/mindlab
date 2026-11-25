@@ -4,7 +4,8 @@ MindLab server: FastAPI + WebSocket around engine.Engine.
 Several people can use one server at once:
   * every WebSocket connection has its own steering (sliders affect only that user's answers),
   * concept vectors live in a shared library (computed once, reused by everyone),
-  * generations run one at a time on the GPU, in a FIFO queue; waiting users see their position.
+  * generations run one at a time on the GPU, in a FIFO queue; waiting users see their position,
+  * an introspection experiment runs one trial per queue turn, so it never blocks others for long.
 
 Env vars:
   MODEL              HF model id or local path (default Qwen/Qwen3-8B)
@@ -28,6 +29,8 @@ import collections
 import hmac
 import os
 import pathlib
+import random
+import re
 import threading
 import traceback
 
@@ -80,10 +83,18 @@ app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["GET", 
 
 # ----------------------------------------------------------------------------- generation queue
 class Job:
-    def __init__(self, req: dict, steer: dict, concepts: list[str] | None, loop, out: asyncio.Queue):
+    def __init__(self, req: dict, steer: dict, concepts: list[str] | None, loop, out: asyncio.Queue,
+                 kind: str = "generate"):
         self.req, self.steer, self.concepts = req, steer, concepts
         self.loop, self.out = loop, out
+        self.kind = kind
         self.stop = False
+        self.plan: list[str | None] = []   # introspection: concept per trial (None = control)
+        self.i = 0
+        self.started = False
+
+    def finished_msg(self) -> dict:
+        return {"type": "introspect_done"} if self.kind == "introspect" else {"type": "done", "text": ""}
 
     def emit(self, msg: dict):
         self.loop.call_soon_threadsafe(self.out.put_nowait, msg)
@@ -133,6 +144,51 @@ def _run(job: Job):
         job.emit({"type": "error", "msg": f"{type(ex).__name__}: {ex}"})
 
 
+THINK_RE = re.compile(r"<think>.*?(</think>|$)", re.S | re.I)
+CLAIM_RE = re.compile(r"\b(yes|i (do )?(detect|notice|sense|feel)|there is|tak|wykrywam|zauważam|czuję)\b", re.I)
+DENY_RE = re.compile(r"^\W*(no|nope|nie)\b", re.I)
+
+
+def score_answer(answer: str, concept: str | None) -> tuple[str, bool, bool]:
+    """-> (answer without <think> blocks, claims an injected thought, names the concept)."""
+    clean = THINK_RE.sub("", answer or "").strip()
+    claims = bool(CLAIM_RE.search(clean)) and not DENY_RE.match(clean)
+    low = clean.lower()
+    mentions = bool(concept) and any(
+        w[:max(4, len(w) - 2)] in low for w in re.findall(r"\w+", concept.lower()) if len(w) >= 3)
+    return clean, claims, mentions
+
+
+def _introspect_trial(job: Job):
+    """Run trial job.i of an introspection experiment (one queue turn)."""
+    e = state["engine"]
+    req = job.req
+    concept = job.plan[job.i]
+    s = dict(req.get("steer") or {})
+    alpha = float(req.get("alpha", 0.3))
+    s["weights"] = {concept: alpha} if concept else {}
+    steer = _steer_from(e, s)
+    msgs = []
+    if str(req.get("system") or "").strip():
+        msgs.append({"role": "system", "content": str(req["system"]).strip()})
+    msgs.append({"role": "user", "content": str(req.get("prompt") or "")})
+    text = e.generate(
+        msgs,
+        max_new_tokens=max(1, min(int(req.get("max_new_tokens", 80)), MAX_TOKENS_CAP)),
+        temperature=float(req.get("temperature", 0.7)),
+        enable_thinking=req.get("thinking"),
+        on_token=lambda t: beat(),
+        should_stop=lambda: job.stop,
+        steer=steer,
+        concepts=[],
+    )
+    if job.stop:
+        return
+    clean, claims, mentions = score_answer(text, concept)
+    job.emit({"type": "trial", "i": job.i, "n": len(job.plan), "concept": concept,
+              "answer": clean, "claims": claims, "mentions": mentions})
+
+
 def worker():
     while True:
         with cv:
@@ -141,15 +197,30 @@ def worker():
             job = waiting.popleft()
             running["job"] = job
             _announce_positions()
-        job.emit({"type": "started"})
+        if not job.started:
+            job.started = True
+            job.emit({"type": "started"})
+        again = False
         try:
-            if not job.stop:
-                _run(job)
+            if job.stop:
+                job.emit(job.finished_msg())
+            elif job.kind == "introspect":
+                try:
+                    _introspect_trial(job)
+                except Exception as ex:  # noqa: BLE001
+                    job.emit({"type": "error", "msg": f"{type(ex).__name__}: {ex}"})
+                    job.stop = True
+                job.i += 1
+                again = job.i < len(job.plan) and not job.stop
+                if not again:
+                    job.emit({"type": "introspect_done"})
             else:
-                job.emit({"type": "done", "text": ""})
+                _run(job)
         finally:
             with cv:
                 running["job"] = None
+                if again:           # next trial goes to the back of the queue: fair to other users
+                    waiting.append(job)
                 _announce_positions()
 
 
@@ -224,6 +295,8 @@ def ping():
 
 class ConceptIn(BaseModel):
     name: str
+    positive: list[str] | None = None
+    negative: list[str] | None = None
 
 
 @app.post("/api/concepts")
@@ -231,21 +304,22 @@ def add_concept(c: ConceptIn):
     beat()
     e = eng()
     try:
-        con = e.add_concept(c.name)
+        con = e.add_concept(c.name, c.positive, c.negative)
     except ValueError as ex:
         raise HTTPException(400, str(ex))
-    return {"name": con.name, "best_gap": round(max(con.gap.values(), default=0), 1),
-            "gap": [round(con.gap.get((s["l"], s["p"]), 0.0), 2) for s in e.site_list()]}
+    return e.concept_report(con)
 
 
-def _steer_from(e, s: dict | None) -> tuple[dict, list[str] | None]:
+def _steer_from(e, s: dict | None) -> dict:
+    """Client steer payload -> engine.build_steer() result for one connection/request."""
     s = s or {}
     weights = {str(k): float(v) for k, v in (s.get("weights") or {}).items()}
     lo = int(s.get("lo", 0))
     hi = int(s.get("hi", e.n_layers - 1))
     passes = s.get("passes")
     passes = [int(p) for p in passes] if passes else None
-    return e.build_delta(weights, lo, hi, passes), bool(s.get("prompt", True))
+    mode = "target" if s.get("mode") == "target" else "add"
+    return e.build_steer(weights, lo, hi, passes, bool(s.get("prompt", True)), mode)
 
 
 # ----------------------------------------------------------------------------- WebSocket
@@ -257,7 +331,7 @@ async def ws_endpoint(ws: WebSocket):
         return
     loop = asyncio.get_running_loop()
     out: asyncio.Queue = asyncio.Queue()
-    steer = {"delta": {}, "prompt": True}   # this connection's steering; read live by its generation
+    steer = {"delta": {}, "targets": {}, "prompt": True}   # this connection's steering; read live by its generation
     job: Job | None = None
 
     async def sender():
@@ -268,9 +342,21 @@ async def ws_endpoint(ws: WebSocket):
     send_task = asyncio.create_task(sender())
 
     def apply_steer(e, s):
-        delta, prompt = _steer_from(e, s)
-        steer["delta"], steer["prompt"] = delta, prompt   # mutate in place: a running job sees it
-        return len(delta)
+        new = _steer_from(e, s)
+        steer.update(new)   # mutate in place: a running generation of this connection sees it
+        return new["sites"]
+
+    def busy():
+        return job is not None and not job.stop and (job in waiting or running["job"] is job)
+
+    def enqueue(new_job) -> bool:
+        with cv:
+            if len(waiting) >= QUEUE_MAX:
+                return False
+            waiting.append(new_job)
+            _announce_positions()
+            cv.notify()
+        return True
 
     try:
         while True:
@@ -287,22 +373,35 @@ async def ws_endpoint(ws: WebSocket):
                 if job:
                     job.stop = True
                     if _cancel(job):
-                        await out.put({"type": "done", "text": ""})
+                        await out.put(job.finished_msg())
             elif t == "generate":
-                if job and not job.stop and (job in waiting or running["job"] is job):
+                if busy():
                     await out.put({"type": "error", "msg": "already generating"})
                     continue
                 await out.put({"type": "steer_ok", "sites": apply_steer(e, msg.get("steer"))})
                 names = msg.get("concepts")
                 names = [str(n) for n in names] if isinstance(names, list) else None
-                with cv:
-                    full = len(waiting) >= QUEUE_MAX
-                    if not full:
-                        job = Job(msg, steer, names, loop, out)
-                        waiting.append(job)
-                        _announce_positions()
-                        cv.notify()
-                if full:
+                new_job = Job(msg, steer, names, loop, out)
+                if enqueue(new_job):
+                    job = new_job
+                else:
+                    await out.put({"type": "error", "msg": "kolejka pełna, spróbuj za chwilę"})
+            elif t == "introspect":
+                if busy():
+                    await out.put({"type": "error", "msg": "already generating"})
+                    continue
+                names = [str(n) for n in (msg.get("concepts") or []) if str(n) in e.concepts]
+                trials = max(1, min(int(msg.get("trials", 10)), 200))
+                n_ctrl = round(trials * min(1.0, max(0.0, float(msg.get("control_frac", 0.5)))))
+                if not names:
+                    n_ctrl = trials
+                plan = [None] * n_ctrl + [names[k % len(names)] for k in range(trials - n_ctrl)] if names else [None] * trials
+                random.Random(msg.get("seed")).shuffle(plan)
+                new_job = Job(msg, steer, None, loop, out, kind="introspect")
+                new_job.plan = plan
+                if enqueue(new_job):
+                    job = new_job
+                else:
                     await out.put({"type": "error", "msg": "kolejka pełna, spróbuj za chwilę"})
     except WebSocketDisconnect:
         pass

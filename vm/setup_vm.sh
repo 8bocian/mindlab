@@ -34,18 +34,30 @@ if ok:
 sys.exit(0 if ok else 1)
 EOF
 }
-if ! torch_ok; then
-  for idx in "" cu130 cu128 cu126; do
-    if [ -z "$idx" ]; then log "Instaluję PyTorch (PyPI)"; uv pip install -q --upgrade torch || continue
-    else log "Próbuję PyTorch z indeksu $idx"; uv pip install -q --upgrade --reinstall torch --index-url "https://download.pytorch.org/whl/$idx" || continue; fi
-    if torch_ok; then break; fi
+# CUDA build matching the driver's major version (newer driver = newer CUDA allowed)
+DRIVER_MAJOR=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | cut -d. -f1 | tr -dc '0-9')
+DRIVER_MAJOR=${DRIVER_MAJOR:-0}
+if [ "$DRIVER_MAJOR" -ge 580 ]; then TORCH_IDX="cu130 cu128 cu126"
+elif [ "$DRIVER_MAJOR" -ge 570 ]; then TORCH_IDX="cu128 cu126"
+else TORCH_IDX="cu126"; fi
+install_torch(){
+  for idx in $TORCH_IDX; do
+    log "Instaluję PyTorch z indeksu $idx (sterownik $DRIVER_MAJOR)"
+    uv pip install -q --upgrade --reinstall torch --index-url "https://download.pytorch.org/whl/$idx" || continue
+    if torch_ok; then return 0; fi
   done
-  torch_ok || { echo "PyTorch nie widzi GPU - sprawdź sterownik (nvidia-smi) i obraz systemu"; exit 1; }
-fi
+  echo "PyTorch nie widzi GPU - sprawdź sterownik (nvidia-smi) i obraz systemu"; exit 1
+}
+torch_ok || install_torch
 
 log "Instaluję zależności serwera"
 uv pip install -q -r "$LAB/server/requirements.txt"
 if [ -n "${EXTRA_PIP:-}" ]; then log "Dodatkowe pakiety: $EXTRA_PIP"; uv pip install -q $EXTRA_PIP; fi
+# dependencies may have replaced PyTorch with a build that does not match the driver
+if ! torch_ok; then log "Zależności podmieniły PyTorcha - instaluję ponownie"; install_torch; fi
+
+uv cache clean -q || true
+rm -rf "$HOME/.cache/pip"
 
 # ---- where to keep model weights: root disk survives hibernation, ephemeral does not ----
 FREE_GB=$(df -BG --output=avail "$HOME" | tail -1 | tr -dc '0-9')
