@@ -80,6 +80,9 @@ canvas{width:100%;display:block}
 .topk .b{height:10px;background:var(--acc);border-radius:4px}
 #overlay{position:fixed;inset:0;background:rgba(8,10,14,.92);display:flex;align-items:center;justify-content:center;z-index:10}
 #overlay .box{max-width:720px;padding:24px;text-align:center}
+#login{margin-top:16px;display:flex;gap:8px;justify-content:center}
+#login input{max-width:260px}
+.queue{color:var(--warn)}
 #overlay pre{text-align:left;white-space:pre-wrap;background:#1a1010;border:1px solid #5a2d2d;padding:12px;border-radius:8px;max-height:50vh;overflow:auto;font:12px var(--mono)}
 .spinner{width:34px;height:34px;border:3px solid var(--line);border-top-color:var(--acc);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 16px}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -88,7 +91,8 @@ canvas{width:100%;display:block}
 </style>
 </head>
 <body>
-<div id="overlay"><div class="box"><div class="spinner" id="spin"></div><div id="ovText">Łączenie z serwerem…</div><pre id="ovErr" hidden></pre></div></div>
+<div id="overlay"><div class="box"><div class="spinner" id="spin"></div><div id="ovText">Łączenie z serwerem…</div><pre id="ovErr" hidden></pre>
+<form id="login" hidden><input type="password" id="pw" placeholder="hasło dostępu" autocomplete="current-password"><button class="primary" type="submit">Wejdź</button></form></div></div>
 
 <header>
   <h1>Mind<span>Lab</span></h1>
@@ -191,6 +195,7 @@ canvas{width:100%;display:block}
 </section>
 </main>
 
+<script src="config.js"></script>
 <script>
 const PALETTE = ["#7aa2ff","#ff7ab6","#5bd69a","#ffb454","#c792ea","#4fd6e0","#ff6b6b","#d4e157","#f78c6c","#82aaff"];
 const S = {
@@ -198,7 +203,32 @@ const S = {
   tokens:[], pinned:null, cur:null, passes:new Set()
 };
 const $ = id => document.getElementById(id);
-const esc = s => s.replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const esc = s => s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// ---------- backend address + password ----------
+const LOCAL = ["localhost","127.0.0.1"].includes(location.hostname);
+const API = LOCAL ? "" : String(window.MINDLAB_API || "").replace(/\/+$/,"");
+const TOKEN_KEY = "mindlab.token", CONCEPTS_KEY = "mindlab.concepts";
+let TOKEN = localStorage.getItem(TOKEN_KEY) || "";
+class AuthError extends Error {}
+async function api(path, opts={}){
+  const headers = {...(opts.headers||{})};
+  if(TOKEN) headers["Authorization"] = "Bearer " + TOKEN;
+  const r = await fetch(API + path, {...opts, headers});
+  if(r.status === 401) throw new AuthError("unauthorized");
+  return r;
+}
+function askPassword(msg){
+  return new Promise(resolve => {
+    $("spin").hidden = true; $("ovText").textContent = msg; $("login").hidden = false; $("pw").value = ""; $("pw").focus();
+    $("login").onsubmit = ev => { ev.preventDefault(); TOKEN = $("pw").value; localStorage.setItem(TOKEN_KEY, TOKEN);
+      $("login").hidden = true; $("spin").hidden = false; $("ovText").textContent = "Sprawdzam…"; resolve(); };
+  });
+}
+function showOverlay(){ $("overlay").hidden = false; $("overlay").style.display = "flex"; }
+function hideOverlay(){ $("overlay").hidden = true; $("overlay").style.display = "none"; }
+let lastAct = Date.now();
+for(const ev of ["keydown","mousedown","wheel","touchstart"]) addEventListener(ev, () => { lastAct = Date.now(); }, {passive:true});
 const vis = s => s.replace(/ /g,"·").replace(/\n/g,"↵").replace(/\t/g,"→") || "∅";
 
 const PRESETS = [
@@ -211,19 +241,30 @@ const PRESETS = [
 
 // ---------- boot ----------
 async function boot(){
+  let h = null;
   for(;;){
     try{
-      const h = await (await fetch("/api/health")).json();
+      h = await (await fetch(API + "/api/health")).json();
       if(h.status === "ready") break;
       if(h.status === "error"){ $("spin").hidden = true; $("ovText").textContent = "Błąd ładowania modelu "+h.model; $("ovErr").hidden=false; $("ovErr").textContent = h.error; return; }
-      $("ovText").textContent = "Ładowanie: " + (h.progress||"") + " … (pierwsze uruchomienie dużego modelu może potrwać kilka minut)";
-    }catch(e){ $("ovText").textContent = "Brak połączenia z serwerem… (czy tunel SSH działa?)"; }
-    await new Promise(r=>setTimeout(r,1500));
+      $("ovText").textContent = "Serwer się uruchamia: " + (h.progress||"") + " … (zwykle 1–5 min)";
+    }catch(e){
+      $("ovText").textContent = LOCAL ? "Brak połączenia z serwerem… (czy tunel SSH działa?)"
+        : "Serwer jest teraz wyłączony. Strona połączy się sama, gdy właściciel go włączy.";
+    }
+    await new Promise(r=>setTimeout(r, 4000));
   }
-  S.info = await (await fetch("/api/info")).json();
-  $("overlay").hidden = true; $("overlay").style.display="none";
-  initUI(); connect();
-  setInterval(()=>fetch("/api/ping",{method:"POST"}).catch(()=>{}), 60000);
+  for(;;){
+    try{ S.info = await (await api("/api/info")).json(); break; }
+    catch(e){
+      if(e instanceof AuthError){ await askPassword(TOKEN ? "Złe hasło. Spróbuj jeszcze raz:" : "Podaj hasło dostępu:"); continue; }
+      $("ovText").textContent = "Błąd połączenia: " + e.message; await new Promise(r=>setTimeout(r, 4000));
+    }
+  }
+  hideOverlay();
+  initUI(); connect(); restoreConcepts();
+  // keep the VM awake only while someone is actually using the page (watchdog hibernates it otherwise)
+  setInterval(()=>{ if(!document.hidden && Date.now()-lastAct < 15*60e3) api("/api/ping",{method:"POST"}).catch(()=>{}); }, 60000);
 }
 
 function initUI(){
@@ -257,7 +298,6 @@ function initUI(){
   });
   $("readSite").onchange = () => renderMind();
   $("colorMode").onchange = () => recolor();
-  for(const name of Object.keys(I.concepts)) addConceptRow(name, I.concepts[name].best_gap);
   PRESETS.forEach(p=>{
     const b = document.createElement("button"); b.textContent = p.name;
     b.onclick = () => { $("input").value = p.text; if(p.sys!==undefined) $("sys").value = p.sys; $("input").focus(); };
@@ -291,36 +331,59 @@ function addConceptRow(name, gap){
   const r = d.querySelector("input");
   r.oninput = () => { S.weights[name] = +r.value; d.querySelector(".val").textContent = (+r.value).toFixed(2); sendSteer(); };
   r.ondblclick = () => { r.value = 0; r.oninput(); };
-  d.querySelector(".x").onclick = async () => {
-    await fetch("/api/concepts/"+encodeURIComponent(name), {method:"DELETE"});
-    S.concepts = S.concepts.filter(c=>c!==name); delete S.weights[name]; d.remove(); sendSteer(); renderMind();
+  d.querySelector(".x").onclick = () => {
+    S.concepts = S.concepts.filter(c=>c!==name); delete S.weights[name]; d.remove(); saveConcepts(); sendSteer(); renderMind();
     const o = [...$("colorMode").options].find(o=>o.value==="c:"+name); if(o) o.remove();
   };
   $("concepts").appendChild(d);
   const o = document.createElement("option"); o.value = "c:"+name; o.textContent = "pojęcie: "+name; $("colorMode").appendChild(o);
+  saveConcepts();
+}
+function saveConcepts(){ localStorage.setItem(CONCEPTS_KEY, JSON.stringify(S.concepts)); }
+async function restoreConcepts(){
+  // your own concept list (this browser); the server keeps a shared library of computed vectors
+  let names; try{ names = JSON.parse(localStorage.getItem(CONCEPTS_KEY)); }catch(e){}
+  if(!Array.isArray(names)) names = S.info.default_concepts || Object.keys(S.info.concepts);
+  for(const name of names){
+    const known = S.info.concepts[name];
+    if(known){ addConceptRow(name, known.best_gap); continue; }
+    try{ const j = await postConcept(name); addConceptRow(j.name, j.best_gap); }   // server restarted: recompute
+    catch(e){ console.warn("concept", name, e); }
+  }
+  renderMind();
+}
+async function postConcept(name){
+  const r = await api("/api/concepts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
+  if(!r.ok) throw new Error(await r.text());
+  return r.json();
 }
 async function addConcept(){
   const name = $("newConcept").value.trim(); if(!name) return;
   $("addConcept").disabled = true; $("addConcept").textContent = "liczę…";
   try{
-    const r = await fetch("/api/concepts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
-    if(!r.ok) throw new Error(await r.text());
-    const j = await r.json(); addConceptRow(j.name, j.best_gap); $("newConcept").value="";
+    const j = await postConcept(name); addConceptRow(j.name, j.best_gap); $("newConcept").value=""; renderMind();
   }catch(e){ alert("Nie udało się: "+e.message); }
   $("addConcept").disabled = false; $("addConcept").textContent = "Dodaj";
 }
 
 // ---------- websocket ----------
 function connect(){
-  const ws = new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws");
+  const base = API ? API.replace(/^http/, "ws") : (location.protocol==="https:"?"wss://":"ws://")+location.host;
+  const ws = new WebSocket(base + "/ws?token=" + encodeURIComponent(TOKEN));
   S.ws = ws;
   ws.onopen = () => { $("conn").textContent="połączony"; $("conn").classList.add("on"); sendSteer(); };
-  ws.onclose = () => { $("conn").textContent="rozłączony"; $("conn").classList.remove("on"); setGen(false); setTimeout(connect, 2000); };
+  ws.onclose = ev => {
+    $("conn").textContent="rozłączony"; $("conn").classList.remove("on"); setGen(false); setQueue(null);
+    if(ev.code === 4401){ showOverlay(); askPassword("Hasło się zmieniło. Podaj nowe:").then(()=>{ hideOverlay(); connect(); }); return; }
+    setTimeout(connect, 3000);
+  };
   ws.onmessage = ev => {
     const m = JSON.parse(ev.data);
     if(m.type==="token") onToken(m);
     else if(m.type==="done") onDone(m);
-    else if(m.type==="error"){ setGen(false); appendNote("⚠️ "+m.msg); }
+    else if(m.type==="error"){ setGen(false); setQueue(null); appendNote("⚠️ "+m.msg); }
+    else if(m.type==="queued") setQueue(m.ahead);
+    else if(m.type==="started") setQueue(null);
     else if(m.type==="steer_ok"){
       const active = Object.entries(S.weights).filter(([k,v])=>Math.abs(v)>1e-3);
       $("bSteer").textContent = active.length ? `wstrzykiwanie: ${active.map(([k,v])=>k+" "+v.toFixed(2)).join(", ")} (${m.sites} miejsc)` : "wstrzykiwanie: wył.";
@@ -340,6 +403,11 @@ function sendSteer(){
 
 // ---------- chat ----------
 function setGen(on){ S.gen=on; $("send").disabled=on; $("stop").disabled=!on; }
+function setQueue(ahead){
+  if(!S.queueEl) return;
+  if(ahead===null || ahead===undefined){ S.queueEl.remove(); S.queueEl = null; return; }
+  S.queueEl.textContent = `⏳ w kolejce, przed tobą: ${ahead} (ktoś inny właśnie generuje odpowiedź)…`;
+}
 function appendNote(t){ const d=document.createElement("div"); d.className="hint"; d.textContent=t; $("chat").appendChild(d); }
 function send(){
   const text = $("input").value.trim(); if(!text || S.gen || !S.ws || S.ws.readyState!==1) return;
@@ -351,6 +419,7 @@ function send(){
   const meta = document.createElement("div"); meta.className="meta";
   meta.textContent = active.length ? `wstrzyknięto: ${active.map(([k,v])=>k+" "+v.toFixed(2)).join(", ")} · warstwy ${steerPayload().lo}–${steerPayload().hi}` : "bez wstrzykiwania";
   a.appendChild(meta);
+  const q = document.createElement("div"); q.className="meta queue"; a.appendChild(q); S.queueEl = q;
   const body = document.createElement("div"); a.appendChild(body); $("chat").appendChild(a);
   S.curBody = body; S.tokens = []; S.pinned = null;
   const msgs = [];
@@ -360,7 +429,7 @@ function send(){
   const th = $("thinking").value;
   setGen(true);
   S.ws.send(JSON.stringify({type:"generate", messages:msgs, max_new_tokens:+$("maxTok").value, temperature:+$("temp").value,
-    thinking: th==="" ? null : th==="1", read: rs, steer: steerPayload()}));
+    thinking: th==="" ? null : th==="1", read: rs, steer: steerPayload(), concepts: S.concepts}));
   $("chat").scrollTop = $("chat").scrollHeight;
 }
 function onToken(m){
@@ -374,7 +443,12 @@ function onToken(m){
   const chat = $("chat"); if(chat.scrollHeight - chat.scrollTop - chat.clientHeight < 120) chat.scrollTop = chat.scrollHeight;
   renderMindThrottled();
 }
-function onDone(m){ setGen(false); S.history.push({role:"assistant", content: S.tokens.map(t=>t.piece).join("")}); renderMind(); }
+function onDone(m){
+  setGen(false); setQueue(null);
+  if(S.tokens.length) S.history.push({role:"assistant", content: S.tokens.map(t=>t.piece).join("")});
+  else { S.history.pop(); appendNote("anulowano"); }   // stopped while still in the queue
+  renderMind();
+}
 function colorTok(sp, m){
   const mode = $("colorMode").value; sp.style.background = "";
   if(mode==="prob"){ const a = 1 - m.prob; sp.style.background = `rgba(255,107,107,${(a*0.55).toFixed(2)})`; sp.title = "p="+m.prob; }

@@ -1,0 +1,8 @@
+# sekrety: klucz API Hyperstack, token tunelu, hasło
+lab.env
+
+.venv/
+.idea/
+__pycache__/
+*.pyc
+.vercel/

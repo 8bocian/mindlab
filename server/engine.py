@@ -156,6 +156,7 @@ class Engine:
         self.base_states: dict[Site, torch.Tensor] | None = None
         self.base_norm: dict[Site, float] = {}
         self.concepts: dict[str, Concept] = {}
+        self.max_concepts = int(os.environ.get("MAX_CONCEPTS", "300"))
         self.load_seconds = round(time.time() - t0, 1)
 
     # ------------------------------------------------------------------ discovery
@@ -270,7 +271,15 @@ class Engine:
         name = name.strip()
         if not name:
             raise ValueError("empty concept")
+        if len(name) > 60:
+            raise ValueError("concept name too long (max 60 chars)")
+        if name in self.concepts:          # shared library: computed once, reused by everyone
+            return self.concepts[name]
+        if len(self.concepts) >= self.max_concepts:
+            raise ValueError(f"concept library full ({self.max_concepts})")
         with self.lock:
+            if name in self.concepts:
+                return self.concepts[name]
             self.ensure_baseline()
             st = self._last_states([t.format(name) for t in TEMPLATES])
             unit, mu, sd, gap = {}, {}, {}, {}
@@ -289,12 +298,11 @@ class Engine:
             self.concepts[name] = c
             return c
 
-    def remove_concept(self, name: str):
-        self.concepts.pop(name, None)
-
-    def set_steering(self, weights: dict[str, float], layer_lo: int, layer_hi: int,
-                     passes: list[int] | None, steer_prompt: bool = True):
-        """weights: concept -> alpha (fraction of typical residual norm)."""
+    def build_delta(self, weights: dict[str, float], layer_lo: int, layer_hi: int,
+                    passes: list[int] | None) -> dict[Site, torch.Tensor]:
+        """Pure: concept weights -> per-site additive vectors. weights: concept -> alpha
+        (fraction of typical residual norm). Does not touch engine state, so every user/request
+        has its own steering; generate() applies it only while that request runs."""
         delta: dict[Site, torch.Tensor] = {}
         passes_set = set(passes) if passes else None
         for s in self.sites:
@@ -312,13 +320,10 @@ class Engine:
                 acc = v if acc is None else acc + v
             if acc is not None:
                 delta[s] = acc
-        self._delta = delta
-        self.steer_on = bool(delta)
-        self.steer_prompt = steer_prompt
-        return len(delta)
+        return delta
 
     # ------------------------------------------------------------------ analysis
-    def _analyze(self, read_site: Site | None, lens_topk: int = 1):
+    def _analyze(self, read_site: Site | None, names: list[str] | None = None):
         rec = self._rec
         sites = [s for s in self.sites if s in rec]
         H = torch.stack([rec[s][0] for s in sites])  # (S, d) float32
@@ -332,7 +337,10 @@ class Engine:
                 for k, s in enumerate(sites)]
         # concept z-scores at read site (+ per-site profile for each concept)
         conc = {}
-        for name, c in self.concepts.items():
+        for name in (names if names is not None else list(self.concepts)):
+            c = self.concepts.get(name)
+            if c is None:
+                continue
             prof = {}
             for k, s in enumerate(sites):
                 if s in c.unit:
@@ -391,63 +399,75 @@ class Engine:
 
     def generate(self, messages, max_new_tokens=200, temperature=0.7, top_p=0.95,
                  enable_thinking=None, read_site: Site | None = None,
-                 on_token=None, should_stop=lambda: False):
+                 on_token=None, should_stop=lambda: False,
+                 steer: dict | None = None, concepts: list[str] | None = None):
+        """steer: {"delta": {site: tensor}, "prompt": bool}. Re-read before every token, so the
+        caller may swap steer["delta"] mid-generation (live sliders); it affects only this request.
+        concepts: names to report z-scores for (default: whole library)."""
+        steer = steer if steer is not None else {"delta": {}, "prompt": True}
         with self.lock:
-            ids = self.build_input(messages, enable_thinking)
-            eos = self._eos_ids()
-            gen: list[int] = []
-            text_so_far = ""
-            past, cur, use_cache = None, ids, True
-            for step in range(max_new_tokens):
-                if should_stop():
-                    break
-                self.recording, self._rec = True, {}
-                self._in_prompt = step == 0
-                with torch.no_grad():
-                    try:
-                        kw = {self._cache_kw: past} if (use_cache and past is not None) else {}
-                        out = self.model(input_ids=cur, use_cache=use_cache, **kw)
-                    except Exception:
-                        if not use_cache:
-                            raise
-                        use_cache = False   # fall back to full recompute each step
-                        full = torch.cat([ids, torch.tensor([gen], device=self.device, dtype=ids.dtype)], 1) if gen else ids
-                        self._rec = {}
-                        out = self.model(input_ids=full, use_cache=False)
-                self.recording = False
-                self._in_prompt = False
-                logits = out.logits[0, -1].float()
-                probs = torch.softmax(logits, -1)
-                tv, ti = probs.topk(5)
-                tid = self._sample(logits, temperature, top_p)
-                lens, conc = self._analyze(read_site)
-                gen.append(tid)
-                new_text = self.tok.decode(gen, skip_special_tokens=False)
-                if new_text.endswith("�") and tid not in eos and step < max_new_tokens - 1:
-                    piece = ""          # incomplete multi-byte character: wait for the next token
-                else:
-                    piece = new_text[len(text_so_far):]
-                    text_so_far = new_text
-                if on_token:
-                    on_token({
-                        "i": step, "id": tid, "piece": piece,
-                        "prob": round(float(probs[tid]), 3),
-                        "top": [{"t": self._piece(int(j)), "p": round(float(v), 3)} for v, j in zip(tv, ti)],
-                        "lens": lens, "concepts": conc,
-                    })
-                if tid in eos:
-                    break
-                if use_cache:
-                    past = getattr(out, self._cache_kw, None)
-                    if past is None:
-                        past = getattr(out, "past_key_values", None) or getattr(out, "cache", None)
-                    if past is None:   # model returned no cache -> recompute each step
-                        use_cache = False
-                if use_cache:
-                    cur = torch.tensor([[tid]], device=self.device, dtype=ids.dtype)
-                else:
-                    cur = torch.cat([ids, torch.tensor([gen], device=self.device, dtype=ids.dtype)], 1)
-            return text_so_far
+            try:
+                ids = self.build_input(messages, enable_thinking)
+                eos = self._eos_ids()
+                gen: list[int] = []
+                text_so_far = ""
+                past, cur, use_cache = None, ids, True
+                for step in range(max_new_tokens):
+                    if should_stop():
+                        break
+                    self._delta = steer.get("delta") or {}
+                    self.steer_on = bool(self._delta)
+                    self.steer_prompt = bool(steer.get("prompt", True))
+                    self.recording, self._rec = True, {}
+                    self._in_prompt = step == 0
+                    with torch.no_grad():
+                        try:
+                            kw = {self._cache_kw: past} if (use_cache and past is not None) else {}
+                            out = self.model(input_ids=cur, use_cache=use_cache, **kw)
+                        except Exception:
+                            if not use_cache:
+                                raise
+                            use_cache = False   # fall back to full recompute each step
+                            full = torch.cat([ids, torch.tensor([gen], device=self.device, dtype=ids.dtype)], 1) if gen else ids
+                            self._rec = {}
+                            out = self.model(input_ids=full, use_cache=False)
+                    self.recording = False
+                    self._in_prompt = False
+                    logits = out.logits[0, -1].float()
+                    probs = torch.softmax(logits, -1)
+                    tv, ti = probs.topk(5)
+                    tid = self._sample(logits, temperature, top_p)
+                    lens, conc = self._analyze(read_site, concepts)
+                    gen.append(tid)
+                    new_text = self.tok.decode(gen, skip_special_tokens=False)
+                    if new_text.endswith("�") and tid not in eos and step < max_new_tokens - 1:
+                        piece = ""          # incomplete multi-byte character: wait for the next token
+                    else:
+                        piece = new_text[len(text_so_far):]
+                        text_so_far = new_text
+                    if on_token:
+                        on_token({
+                            "i": step, "id": tid, "piece": piece,
+                            "prob": round(float(probs[tid]), 3),
+                            "top": [{"t": self._piece(int(j)), "p": round(float(v), 3)} for v, j in zip(tv, ti)],
+                            "lens": lens, "concepts": conc,
+                        })
+                    if tid in eos:
+                        break
+                    if use_cache:
+                        past = getattr(out, self._cache_kw, None)
+                        if past is None:
+                            past = getattr(out, "past_key_values", None) or getattr(out, "cache", None)
+                        if past is None:   # model returned no cache -> recompute each step
+                            use_cache = False
+                    if use_cache:
+                        cur = torch.tensor([[tid]], device=self.device, dtype=ids.dtype)
+                    else:
+                        cur = torch.cat([ids, torch.tensor([gen], device=self.device, dtype=ids.dtype)], 1)
+                return text_so_far
+            finally:
+                self.steer_on = False
+                self._delta = {}
 
     @staticmethod
     def _sample(logits, temperature, top_p):
@@ -469,5 +489,5 @@ class Engine:
             "max_passes": self.max_passes, "hidden": self.hidden,
             "layers_path": self.layers_name, "norm": type(self.norm).__name__,
             "sites": self.site_list(), "load_seconds": self.load_seconds,
-            "concepts": {n: {"best_gap": round(max(c.gap.values(), default=0), 1)} for n, c in self.concepts.items()},
+            "concepts": {n: {"best_gap": round(max(c.gap.values(), default=0), 1)} for n, c in list(self.concepts.items())},
         }

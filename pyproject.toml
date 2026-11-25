@@ -9,6 +9,7 @@ requires-python = ">=3.13"
 dependencies = [
     "paramiko>=5.1.0",
     "requests>=2.34.2",
+    "truststore>=0.10.5",
 ]
 
 [project.scripts]

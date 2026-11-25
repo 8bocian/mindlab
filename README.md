@@ -89,7 +89,57 @@ Pozostałe komendy:
 - Czy wstrzyknięcie tylko w 1. przejście działa inaczej niż tylko w 3.?
 - W którym przejściu odpowiedź „krzepnie” w logit lensie?
 
-## 5. Jak to działa (w skrócie)
+## 5. Tryb dla kilku osób: frontend na Vercelu, backend na Hyperstacku
+
+```
+znajomi ──► mindlab.vercel.app (index.html + config.js, zawsze online)
+              │  fetch + WebSocket, hasło
+              ▼
+         https://mindlab-api.twojadomena.pl ──(Cloudflare Tunnel)──► VM Hyperstack :8000
+```
+
+- Każdy ma **własne suwaki**: wstrzykiwanie jednej osoby nie wpływa na odpowiedzi innych.
+- Wektory pojęć są w **wspólnej bibliotece** (liczone raz), ale każdy widzi tylko swoją listę. „×” chowa pojęcie tylko u ciebie.
+- GPU generuje jedną odpowiedź naraz, reszta czeka w **kolejce** i widzi swoją pozycję.
+- Gdy VM jest wyłączona, strona pokazuje „serwer jest teraz wyłączony” i sama się połączy po starcie.
+- Strażnik hibernuje VM po `IDLE_MINUTES` bez aktywności. Otwarta, ale nieużywana karta nie podtrzymuje VM.
+
+Instrukcja konfiguracji krok po kroku jest w sekcji 6.
+
+## 6. Konfiguracja trybu publicznego (jednorazowo)
+
+**A. Domena w Cloudflare.** Załóż konto na cloudflare.com, dodaj swoją domenę (*Add a domain*) i zmień nameservery u rejestratora na te, które poda Cloudflare. Domenę możesz też kupić od razu w Cloudflare (*Domain Registration*).
+
+**B. Tunel.** W panelu Cloudflare: *Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared*, nazwa np. `mindlab`. Na ekranie instalacji skopiuj sam **token** (długi ciąg po `--token`). Niczego nie instalujesz, zrobi to `lab.py`. W zakładce *Public Hostname* dodaj: subdomena `mindlab-api`, domena twoja, *Service* `HTTP` → `localhost:8000`.
+
+**C. `lab.env`:**
+```
+CLOUDFLARE_TUNNEL_TOKEN=eyJh...
+ACCESS_PASSWORD=jakies-dlugie-haslo-dla-znajomych
+ALLOWED_ORIGINS=https://mindlab.vercel.app
+PUBLIC_URL=https://mindlab.vercel.app
+```
+
+**D. `server/static/config.js`:** wpisz adres tunelu:
+```js
+window.MINDLAB_API = "https://mindlab-api.twojadomena.pl";
+```
+
+**E. Vercel.** Wypchnij repo na GitHuba (`lab.env` jest w `.gitignore`). Na vercel.com: *Add New → Project →* wybierz repo, **Root Directory: `server/static`**, Framework Preset: *Other*, *Deploy*. Dostaniesz adres typu `mindlab-xyz.vercel.app`. Jeśli różni się od tego w `ALLOWED_ORIGINS`, popraw go w `lab.env`.
+
+**Pierwsza instalacja i każda zmiana kodu lub `lab.env`:**
+```bash
+python lab.py start       # instaluje VM: serwer, tunel i strażnik jako usługi systemd, potem kończy
+```
+
+**Na co dzień, bez `lab.py` i bez twojego komputera:** w panelu Hyperstack (*Virtual Machines*):
+- **włączanie:** *Restore* (z hibernacji). Po ok. 2–3 min od stanu ACTIVE dashboard działa sam,
+- **wyłączanie:** *Hibernate*. **Nie używaj *Stop*:** zatrzymana VM nalicza pełną stawkę,
+- strażnik i tak zahibernuje VM po `IDLE_MINUTES` bez aktywności albo po `MAX_HOURS`, licząc od każdego startu.
+
+Pomocniczo z terminala: `python lab.py status` (czy nalicza), `python lab.py hibernate`, `python lab.py logs` (logi serwera, strażnika i tunelu).
+
+## 7. Jak to działa (w skrócie)
 
 - **Wektor pojęcia**: model czyta kilka zdań z danym słowem („Tell me about ocean.”, „I keep thinking about ocean.”…) i te same zdania z 48 neutralnymi słowami. Różnica średnich stanów wewnętrznych w każdej warstwie daje kierunek „ocean”.
 - **Wstrzyknięcie**: do stanu każdego tokena w wybranych warstwach dodawany jest ten kierunek, przeskalowany przez typową długość stanu w danej warstwie. Stąd suwak „0,3” oznacza ok. 30% typowej długości.
@@ -97,7 +147,7 @@ Pozostałe komendy:
 - **Logit lens**: stan z każdej warstwy przechodzi przez końcową normalizację i warstwę wyjściową modelu, czyli „co by powiedział, gdyby skończył myśleć tutaj”.
 - **Pętle**: serwer liczy, ile razy każda warstwa uruchamia się na jeden token. Jeśli więcej niż raz, model ma pętlę i każde przejście jest osobnym miejscem.
 
-Całość działa na zwykłym `transformers` z hookami PyTorcha. vLLM nie jest tu potrzebny: dashboard jest dla jednej osoby, a takie podejście daje pełną kontrolę i działa z prawie każdym modelem.
+Całość działa na zwykłym `transformers` z hookami PyTorcha. vLLM nie jest tu potrzebny: przy kilku osobach wystarcza kolejka, a takie podejście daje pełną kontrolę i działa z prawie każdym modelem.
 
 ## 6. Koszty i bezpieczeństwo
 

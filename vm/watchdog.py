@@ -4,6 +4,8 @@ Runs ON THE VM (stdlib only). Hibernates or deletes this VM via the Hyperstack A
   * nobody used the dashboard / setup for IDLE_MINUTES, or
   * the VM has been up for more than MAX_HOURS.
 This protects you if your laptop sleeps or loses connection while the VM is running.
+Runs as a systemd service, so it starts on every boot (also after restoring from hibernation in the
+Hyperstack panel). Both timers count from this process's start, never from an earlier session.
 Reads ~/mindlab/watchdog.env (chmod 600): HYPERSTACK_API_KEY, VM_ID, ACTION, IDLE_MINUTES, MAX_HOURS
 """
 import json
@@ -32,13 +34,13 @@ def call(method, path, key):
         return json.loads(r.read() or b"{}")
 
 
-def last_activity():
-    ts = []
+def last_activity(started):
+    ts = [started]   # old heartbeat from before hibernation must not count as "idle since then"
     for name in ("heartbeat", "setup.log"):
         f = LAB / name
         if f.exists():
             ts.append(f.stat().st_mtime)
-    return max(ts) if ts else time.time()
+    return max(ts)
 
 
 def main():
@@ -47,11 +49,11 @@ def main():
     action = env.get("ACTION", "hibernate")
     idle_s = float(env.get("IDLE_MINUTES", "30")) * 60
     max_s = float(env.get("MAX_HOURS", "8")) * 3600
-    started = float(env.get("STARTED_AT", time.time()))
+    started = time.time()   # this boot / this run, not STARTED_AT from the original lab.py session
     print(f"watchdog: vm={vm_id} action={action} idle={idle_s/60:.0f}min max={max_s/3600:.1f}h", flush=True)
     while True:
         now = time.time()
-        idle, up = now - last_activity(), now - started
+        idle, up = now - last_activity(started), now - started
         reason = None
         if idle > idle_s:
             reason = f"bezczynność {idle/60:.0f} min"

@@ -5,6 +5,9 @@ MindLab – wynajmij GPU na Hyperstacku, uruchom dashboard, posprzątaj.
   python lab.py check       # sprawdź klucz API, regiony, klucze SSH, dostępne GPU i obrazy
   python lab.py up          # wynajmij/wybudź VM, zainstaluj, uruchom, otwórz dashboard
   python lab.py up --keep   # jak wyżej, ale po Ctrl+C NIE hibernuj/usuwaj
+  python lab.py start       # tryb publiczny: zainstaluj/zaktualizuj VM (serwer + tunel jako usługi) i zakończ;
+                            #   potem włączasz/wyłączasz VM w panelu Hyperstack (Restore / Hibernate),
+                            #   serwer i tunel startują same; lab.py tylko przy zmianie kodu/konfiguracji
   python lab.py status      # stan VM i szacowany koszt
   python lab.py hibernate   # zahibernuj (płacisz tylko za dysk)
   python lab.py down        # usuń VM całkowicie (nic nie płacisz)
@@ -28,6 +31,12 @@ import time
 import webbrowser
 
 try:
+    # use the OS certificate store (works behind antivirus/corporate HTTPS scanning, e.g. Norton)
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+try:
     import requests
 except ImportError:
     sys.exit("Brak pakietu requests:  pip install requests paramiko")
@@ -35,7 +44,7 @@ except ImportError:
 ROOT = pathlib.Path(__file__).resolve().parent
 BASE = os.environ.get("HYPERSTACK_API_BASE", "https://infrahub-api.nexgencloud.com/v1")
 SERVER_ENV_KEYS = ["MODEL", "DTYPE", "TRUST_REMOTE_CODE", "HF_TOKEN", "LAYERS_PATH", "NORM_PATH",
-                   "DEFAULT_CONCEPTS", "EXTRA_PIP"]
+                   "DEFAULT_CONCEPTS", "EXTRA_PIP", "ACCESS_PASSWORD", "ALLOWED_ORIGINS", "MAX_NEW_TOKENS_CAP"]
 
 
 # ----------------------------------------------------------------------------- config
@@ -55,7 +64,8 @@ def load_cfg(path: pathlib.Path) -> dict:
                     GPU_MATCH="RTXPRO6000", GPU_COUNT="1", FLAVOR_NAME="", IMAGE_NAME="", IMAGE_PREFER="24.04",
                     VM_NAME="mindlab", PRICE_PER_HOUR="0", END_ACTION="hibernate", WATCHDOG="1",
                     IDLE_MINUTES="30", MAX_HOURS="8", MODEL="Qwen/Qwen3-8B", DTYPE="auto",
-                    TRUST_REMOTE_CODE="0", LOCAL_PORT="8000")
+                    TRUST_REMOTE_CODE="0", LOCAL_PORT="8000", CLOUDFLARE_TUNNEL_TOKEN="", ACCESS_PASSWORD="",
+                    ALLOWED_ORIGINS="*", PUBLIC_URL="", MAX_NEW_TOKENS_CAP="400")
     for k, v in defaults.items():
         if not cfg.get(k):
             cfg[k] = v
@@ -312,7 +322,8 @@ def upload(ssh, cfg, vm_id):
     mkdir(lab)
     mkdir(f"{lab}/server")
     mkdir(f"{lab}/server/static")
-    for rel in ["server/app.py", "server/engine.py", "server/requirements.txt", "server/static/index.html"]:
+    for rel in ["server/app.py", "server/engine.py", "server/requirements.txt", "server/static/index.html",
+                "server/static/config.js"]:
         sftp.put(str(ROOT / rel), f"{lab}/{rel}")
     for name in ["setup_vm.sh", "start_server.sh", "watchdog.py"]:
         sftp.put(str(ROOT / "vm" / name), f"{lab}/{name}")
@@ -320,6 +331,16 @@ def upload(ssh, cfg, vm_id):
     with sftp.open(f"{lab}/server.env", "w") as f:
         f.write("\n".join(env_lines) + "\n")
     sftp.chmod(f"{lab}/server.env", 0o600)
+    tn = f"{lab}/tunnel.env"
+    if cfg["CLOUDFLARE_TUNNEL_TOKEN"]:
+        with sftp.open(tn, "w") as f:
+            f.write(f"TUNNEL_TOKEN={shlex.quote(cfg['CLOUDFLARE_TUNNEL_TOKEN'])}\n")
+        sftp.chmod(tn, 0o600)
+    else:
+        try:
+            sftp.remove(tn)
+        except OSError:
+            pass
     wd = f"{lab}/watchdog.env"
     if cfg["WATCHDOG"] == "1" and cfg["END_ACTION"] in ("hibernate", "delete"):
         with sftp.open(wd, "w") as f:
@@ -354,7 +375,7 @@ def ssh_base(cfg, ip):
 
 # ----------------------------------------------------------------------------- lifecycle
 def wait_active(hs, vm_id, timeout_s=1800):
-    t0, last = time.time(), None
+    t0, last, asked_ip, active_since = time.time(), None, False, 0.0
     while time.time() - t0 < timeout_s:
         vm = hs.vm(vm_id)
         st = status_of(vm)
@@ -363,6 +384,16 @@ def wait_active(hs, vm_id, timeout_s=1800):
             last = st
         if st == "ACTIVE" and vm.get("floating_ip"):
             return vm
+        if st == "ACTIVE" and not active_since:
+            active_since = time.time()
+        if st == "ACTIVE" and not asked_ip and time.time() - active_since > 60:
+            # restoring from hibernation releases the public IP; ask for a new one
+            asked_ip = True
+            say("VM nie ma publicznego IP (po hibernacji) - podłączam nowy…")
+            try:
+                hs.req("POST", f"/core/virtual-machines/{vm_id}/attach-floatingip")
+            except HSError as e:
+                warn(f"nie udało się podłączyć IP ({e}); podłącz je w panelu Hyperstack")
         if st == "HIBERNATED":          # e.g. we arrived while it was still HIBERNATING
             say("VM zahibernowana - wybudzam…")
             hs.restore(vm_id)
@@ -403,7 +434,12 @@ def finish(hs, cfg, vm_id, action):
         warn(f"Nie udało się ({e}). SPRAWDŹ PANEL HYPERSTACK, żeby VM nie naliczała opłat!")
 
 
-def cmd_up(hs, cfg, keep=False):
+def cmd_up(hs, cfg, keep=False, detach=False):
+    if detach and not cfg["CLOUDFLARE_TUNNEL_TOKEN"]:
+        sys.exit("'start' wymaga CLOUDFLARE_TUNNEL_TOKEN w lab.env (instrukcja w README, sekcja 6).")
+    if cfg["CLOUDFLARE_TUNNEL_TOKEN"] and len(cfg["ACCESS_PASSWORD"]) < 10:
+        sys.exit("Serwer będzie publiczny (CLOUDFLARE_TUNNEL_TOKEN): ustaw ACCESS_PASSWORD w lab.env (min. 10 znaków),\n"
+                 "inaczej każdy, kto zna adres, użyje Twojego GPU.")
     env = find_env(hs, cfg)
     region = env.get("region")
     vm = find_vm(hs, cfg)
@@ -450,9 +486,10 @@ def cmd_up(hs, cfg, keep=False):
         if code != 0:
             raise RuntimeError("instalacja na VM nie powiodła się (szczegóły powyżej)")
         run(ssh, f"bash {lab}/start_server.sh")
-        port = free_port(int(cfg["LOCAL_PORT"]))
-        tunnel = subprocess.Popen(ssh_base(cfg, ip)[:-1] + ["-N", "-L", f"{port}:127.0.0.1:8000", ssh_base(cfg, ip)[-1]])
-        url = f"http://localhost:{port}"
+        if not detach:
+            port = free_port(int(cfg["LOCAL_PORT"]))
+            tunnel = subprocess.Popen(ssh_base(cfg, ip)[:-1] + ["-N", "-L", f"{port}:127.0.0.1:8000", ssh_base(cfg, ip)[-1]])
+            url = f"http://localhost:{port}"
         say("czekam, aż model się załaduje…")
         last = ""
         while True:
@@ -471,6 +508,16 @@ def cmd_up(hs, cfg, keep=False):
                 last = prog
                 say(f"  {last}")
             time.sleep(5)
+        if detach:
+            say("GOTOWE. Serwer działa publicznie przez tunel Cloudflare.", "32")
+            if cfg["PUBLIC_URL"]:
+                say(f"Dashboard: {cfg['PUBLIC_URL']}", "32")
+                webbrowser.open(cfg["PUBLIC_URL"])
+            say("Od teraz włączasz i wyłączasz VM w panelu Hyperstack: Hibernate / Restore (NIE Stop - "
+                "zatrzymana VM nalicza pełną stawkę). Serwer i tunel wstają same po każdym starcie.", "32")
+            warn(f"VM nalicza pełną stawkę, dopóki jej nie zahibernujesz (panel albo: python lab.py hibernate).\n"
+                 f"   Strażnik i tak ją zahibernuje po {cfg['IDLE_MINUTES']} min bez aktywności lub po {cfg['MAX_HOURS']} h.")
+            return
         say(f"GOTOWE → {url}   (Ctrl+C kończy sesję i wykonuje: {'keep' if keep else cfg['END_ACTION']})", "32")
         webbrowser.open(url)
         price = float(cfg["PRICE_PER_HOUR"] or 0)
@@ -542,7 +589,7 @@ def cmd_check(hs, cfg):
 
 def main():
     ap = argparse.ArgumentParser(description="MindLab na Hyperstacku")
-    ap.add_argument("command", choices=["check", "up", "down", "hibernate", "status", "logs", "ssh"])
+    ap.add_argument("command", choices=["check", "up", "start", "down", "hibernate", "status", "logs", "ssh"])
     ap.add_argument("--keep", action="store_true", help="po Ctrl+C zostaw VM włączoną")
     ap.add_argument("--config", default=str(ROOT / "lab.env"))
     a = ap.parse_args()
@@ -553,6 +600,8 @@ def main():
             cmd_check(hs, cfg)
         elif a.command == "up":
             cmd_up(hs, cfg, keep=a.keep)
+        elif a.command == "start":
+            cmd_up(hs, cfg, detach=True)
         else:
             vm = find_vm(hs, cfg)
             if not vm:
@@ -569,7 +618,8 @@ def main():
                 finish(hs, cfg, vm["id"], "hibernate")
             elif a.command == "logs":
                 ssh = ssh_connect(cfg, vm["floating_ip"], timeout_s=30)
-                run(ssh, "tail -n 60 ~/mindlab/server.log; echo ---; tail -n 20 ~/mindlab/watchdog.log 2>/dev/null")
+                run(ssh, "tail -n 60 ~/mindlab/server.log; echo ---; tail -n 20 ~/mindlab/watchdog.log 2>/dev/null; "
+                         "echo ---; tail -n 15 ~/mindlab/tunnel.log 2>/dev/null")
             elif a.command == "ssh":
                 print(" ".join(shlex.quote(x) for x in ssh_base(cfg, vm.get("floating_ip") or "IP")))
     except HSError as e:

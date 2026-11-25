@@ -61,6 +61,16 @@ mkdir -p "$HF_HOME"
 echo "export HF_HOME=$HF_HOME" > "$LAB/runtime.env"
 export HF_HOME
 
+# ---- cloudflared (only when a Cloudflare Tunnel token was configured) ----
+if [ -f "$LAB/tunnel.env" ] && ! command -v cloudflared >/dev/null; then
+  case "$(uname -m)" in aarch64|arm64) CF_ARCH=arm64 ;; *) CF_ARCH=amd64 ;; esac
+  log "Instaluję cloudflared ($CF_ARCH)"
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL -o "$HOME/.local/bin/cloudflared" \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$CF_ARCH"
+  chmod +x "$HOME/.local/bin/cloudflared"
+fi
+
 log "Pobieram model $MODEL do $HF_HOME (przy pierwszym razie może to chwilę potrwać)"
 if [ -d "$MODEL" ]; then
   log "MODEL to lokalny katalog - pomijam pobieranie"

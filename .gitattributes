@@ -1,0 +1,4 @@
+# skrypty i kod lecą na VM z Linuksem: zawsze LF
+*.sh text eol=lf
+*.py text eol=lf
+server/** text eol=lf
