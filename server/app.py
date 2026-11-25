@@ -134,6 +134,9 @@ def _run(job: Job):
 
 
 def worker():
+    # load + warm up the model in THIS thread: the generations run here too, and part of the GPU kernel
+    # warm-up (Triton autotuning) did not carry over when it was done in another thread
+    _load()
     while True:
         with cv:
             while not waiting:
@@ -171,6 +174,15 @@ def _load():
         for c in DEFAULT_CONCEPTS:
             state["progress"] = f"concept: {c}"
             eng.add_concept(c)
+        # the first generations compile/autotune GPU kernels (Triton) and are several times slower:
+        # do them now, so the first real user gets full speed
+        state["progress"] = "warm-up"
+        for _ in range(2):
+            try:
+                eng.generate([{"role": "user", "content": "Tell me a short story about a lighthouse."}],
+                             max_new_tokens=48, temperature=0.0, enable_thinking=False, concepts=[])
+            except Exception:  # noqa: BLE001 - warm-up is best effort
+                break
         state["engine"] = eng
         state["status"] = "ready"
         state["progress"] = "ready"
@@ -182,8 +194,7 @@ def _load():
 @app.on_event("startup")
 def startup():
     beat()
-    threading.Thread(target=_load, daemon=True).start()
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=worker, daemon=True).start()   # loads the model, then serves the queue
 
 
 def eng():

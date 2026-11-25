@@ -139,7 +139,7 @@ python lab.py start       # instaluje VM: serwer, tunel i strażnik jako usługi
 
 Pomocniczo z terminala: `python lab.py status` (czy nalicza), `python lab.py hibernate`, `python lab.py logs` (logi serwera, strażnika i tunelu).
 
-**Gdy *Restore* w panelu odmawia („Not Enough Stock”):** uruchom `python lab.py start`. Spróbuje wybudzić VM, a jeśli brak kart tego typu, utworzy nową VM na pierwszej dostępnej karcie z `GPU_FALLBACK` (domyślnie A100 → L40 → H100, bez wersji spot). To pełna instalacja, ok. 10–15 min. Starą VM usunie dopiero, gdy nowa działa (`DELETE_OLD_ON_FALLBACK=1`). `python lab.py check` pokazuje, które karty z listy są teraz dostępne.
+**Gdy *Restore* w panelu odmawia („Not Enough Stock”):** uruchom `python lab.py start`. Spróbuje wybudzić VM, a jeśli brak kart tego typu, utworzy nową VM na pierwszej dostępnej karcie z `GPU_FALLBACK` (domyślnie A100 → H100, bez wersji spot). To pełna instalacja, ok. 10–15 min. Starą VM usunie dopiero, gdy nowa działa (`DELETE_OLD_ON_FALLBACK=1`). `python lab.py check` pokazuje, które karty z listy są teraz dostępne.
 
 ## 7. Jak to działa (w skrócie)
 

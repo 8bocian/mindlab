@@ -89,4 +89,26 @@ if [ -d "$MODEL" ]; then
 else
   HF_TOKEN="${HF_TOKEN:-}" hf download "$MODEL" --exclude "*.gguf" --exclude "original/*" >/dev/null
 fi
+# ---- fast kernels for models with linear/hybrid attention (Qwen3.5, Qwen3.6, Qwen3-Next…) ----
+# without them transformers falls back to slow reference PyTorch code
+NEEDS_FLA=$(python - <<'EOF' 2>/dev/null
+import json, os, glob
+from huggingface_hub import hf_hub_download
+m = os.environ["MODEL"]
+try:
+    p = os.path.join(m, "config.json") if os.path.isdir(m) else hf_hub_download(m, "config.json")
+    c = json.load(open(p))
+    c = {**c, **c.get("text_config", {})}
+    linear = "linear_attention" in json.dumps(c.get("layer_types", [])) or any(
+        k in str(c.get("model_type", "")) for k in ("qwen3_5", "qwen3_6", "qwen3_next"))
+    print(1 if linear else 0)
+except Exception:
+    print(0)
+EOF
+)
+if [ "$NEEDS_FLA" = "1" ]; then
+  export PATH="/usr/local/cuda/bin:$PATH"
+  python -c "import fla" 2>/dev/null || { log "Instaluję flash-linear-attention (szybka atencja liniowa)"; uv pip install -q flash-linear-attention || log "UWAGA: flash-linear-attention się nie zainstalował - model będzie wolniejszy"; }
+  python -c "import causal_conv1d" 2>/dev/null || { log "Kompiluję causal-conv1d (jednorazowo, ok. 5-10 min)"; uv pip install -q causal-conv1d --no-build-isolation || log "UWAGA: causal-conv1d się nie zainstalował - model będzie wolniejszy"; }
+fi
 log "Gotowe ✔"
