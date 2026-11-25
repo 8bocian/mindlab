@@ -342,57 +342,54 @@ class Engine:
                 "gap": [round(c.gap.get(s, 0.0), 2) for s in self.sites],
                 "suggest": [max(0, best - 1), min(n - 1, best + 1)]}
 
+    def _plan(self, weights: dict[str, float], layer_lo: int, layer_hi: int, passes: list[int] | None,
+              ranges: dict[str, tuple[int, int]] | None):
+        """Yield (site, concept, alpha) for every place a concept should be injected.
+        Each concept uses its own layer range from `ranges`, else the shared layer_lo..layer_hi."""
+        passes_set = set(passes) if passes else None
+        ranges = ranges or {}
+        for name, a in weights.items():
+            c = self.concepts.get(name)
+            if c is None or abs(a) < 1e-6:
+                continue
+            lo, hi = ranges.get(name, (layer_lo, layer_hi))
+            for s in self.sites:
+                l, p = s
+                if lo <= l <= hi and (passes_set is None or p in passes_set) and s in c.unit:
+                    yield s, c, a
+
     def build_delta(self, weights: dict[str, float], layer_lo: int, layer_hi: int,
-                    passes: list[int] | None) -> dict[Site, torch.Tensor]:
+                    passes: list[int] | None, ranges: dict[str, tuple[int, int]] | None = None
+                    ) -> dict[Site, torch.Tensor]:
         """Pure: concept weights -> per-site additive vectors. weights: concept -> alpha
         (fraction of typical residual norm). Does not touch engine state, so every user/request
         has its own steering; generate() applies it only while that request runs."""
         delta: dict[Site, torch.Tensor] = {}
-        passes_set = set(passes) if passes else None
-        for s in self.sites:
-            l, p = s
-            if not (layer_lo <= l <= layer_hi):
-                continue
-            if passes_set is not None and p not in passes_set:
-                continue
-            acc = None
-            for name, a in weights.items():
-                c = self.concepts.get(name)
-                if c is None or abs(a) < 1e-6 or s not in c.unit:
-                    continue
-                v = a * self.base_norm.get(s, 1.0) * c.unit[s]
-                acc = v if acc is None else acc + v
-            if acc is not None:
-                delta[s] = acc
+        for s, c, a in self._plan(weights, layer_lo, layer_hi, passes, ranges):
+            v = a * self.base_norm.get(s, 1.0) * c.unit[s]
+            delta[s] = v if s not in delta else delta[s] + v
         return delta
 
     def build_targets(self, weights: dict[str, float], layer_lo: int, layer_hi: int,
-                      passes: list[int] | None) -> dict[Site, list]:
+                      passes: list[int] | None, ranges: dict[str, tuple[int, int]] | None = None
+                      ) -> dict[Site, list]:
         """Target mode: alpha -> target z = alpha * Z_MAX above the neutral mean (negative: below)."""
         targets: dict[Site, list] = {}
-        passes_set = set(passes) if passes else None
-        for s in self.sites:
-            l, p = s
-            if not (layer_lo <= l <= layer_hi):
-                continue
-            if passes_set is not None and p not in passes_set:
-                continue
-            for name, a in weights.items():
-                c = self.concepts.get(name)
-                if c is None or abs(a) < 1e-6 or s not in c.unit:
-                    continue
-                tgt = c.mu[s] + a * self.Z_MAX * c.sd[s]
-                targets.setdefault(s, []).append((c.unit[s], tgt, a > 0))
+        for s, c, a in self._plan(weights, layer_lo, layer_hi, passes, ranges):
+            tgt = c.mu[s] + a * self.Z_MAX * c.sd[s]
+            targets.setdefault(s, []).append((c.unit[s], tgt, a > 0))
         return targets
 
     def build_steer(self, weights: dict[str, float], layer_lo: int, layer_hi: int,
-                    passes: list[int] | None, steer_prompt: bool = True, mode: str = "add") -> dict:
+                    passes: list[int] | None, steer_prompt: bool = True, mode: str = "add",
+                    ranges: dict[str, tuple[int, int]] | None = None) -> dict:
         """Steering for ONE request (pass to generate(steer=...)). mode: "add" = constant
-        alpha * |h|_typical * unit; "target" = clamp the concept's projection to its target z."""
+        alpha * |h|_typical * unit; "target" = clamp the concept's projection to its target z.
+        ranges: optional per-concept layer range {name: (lo, hi)} overriding layer_lo..layer_hi."""
         if mode == "target":
-            delta, targets = {}, self.build_targets(weights, layer_lo, layer_hi, passes)
+            delta, targets = {}, self.build_targets(weights, layer_lo, layer_hi, passes, ranges)
         else:
-            delta, targets = self.build_delta(weights, layer_lo, layer_hi, passes), {}
+            delta, targets = self.build_delta(weights, layer_lo, layer_hi, passes, ranges), {}
         return {"delta": delta, "targets": targets, "prompt": bool(steer_prompt),
                 "sites": len(set(delta) | set(targets))}
 
