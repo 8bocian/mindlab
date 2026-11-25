@@ -91,11 +91,13 @@ else
 fi
 # ---- fast kernels for models with linear/hybrid attention (Qwen3.5, Qwen3.6, Qwen3-Next…) ----
 # without them transformers falls back to slow reference PyTorch code
-NEEDS_FLA=$(python - <<'EOF' 2>/dev/null
-import json, os, glob
-from huggingface_hub import hf_hub_download
-m = os.environ["MODEL"]
+# MODEL comes from server.env as a plain shell variable: pass it explicitly. "|| echo 0": a failed
+# check must never abort the whole setup (set -e)
+NEEDS_FLA=$(MODEL="$MODEL" python - <<'EOF' 2>/dev/null || echo 0
+import json, os
 try:
+    from huggingface_hub import hf_hub_download
+    m = os.environ["MODEL"]
     p = os.path.join(m, "config.json") if os.path.isdir(m) else hf_hub_download(m, "config.json")
     c = json.load(open(p))
     c = {**c, **c.get("text_config", {})}

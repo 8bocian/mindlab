@@ -332,6 +332,61 @@ def run(ssh, cmd, show=True):
     return chan.recv_exit_status(), buf.decode("utf-8", errors="replace")
 
 
+class Remote:
+    """SSH to the VM that survives drops (laptop sleep, Wi-Fi hiccup): reconnects and retries."""
+    def __init__(self, cfg, ip, ssh=None):
+        self.cfg, self.ip, self.ssh = cfg, ip, ssh
+
+    def run(self, cmd, show=False, tries=30):
+        for attempt in range(tries):
+            try:
+                if self.ssh is None:
+                    self.ssh = ssh_connect(self.cfg, self.ip, timeout_s=120)
+                return run(self.ssh, cmd, show=show)
+            except Exception as e:  # noqa: BLE001 - network gone: wait and reconnect
+                if attempt == 0:
+                    warn(f"połączenie z VM przerwane ({type(e).__name__}) - łączę ponownie, VM pracuje dalej sama…")
+                self.ssh = None
+                time.sleep(10)
+        raise RuntimeError("nie mogę ponownie połączyć się z VM - sprawdź internet i uruchom lab.py start jeszcze raz")
+
+
+def deploy_on_vm(remote, lab):
+    """Run setup + server (re)start ON THE VM in the background (nohup + setsid), so it finishes even if
+    this laptop disconnects or sleeps; here we only stream the log and wait for the result."""
+    # 1) stop a previous run. Separate command, and "[s]etup" / "[h]f" patterns: pkill -f matches whole
+    #    command lines, so a pattern that appears literally in its own command would kill this very shell
+    remote.run(f"pkill -f 'mindlab/[s]etup_vm.sh'; pkill -f '[h]f download'; rm -f {lab}/deploy.rc; : > {lab}/setup.log")
+    # 2) start setup + server restart detached from this SSH session
+    #    setsid -f detaches synchronously (new session, no terminal) BEFORE this command returns; a plain
+    #    "nohup ... &" at the end of the command raced with the SSH session closing and got killed
+    remote.run(f"setsid -f nohup bash -c 'bash {lab}/setup_vm.sh && bash {lab}/start_server.sh; echo $? > {lab}/deploy.rc' "
+               f"> {lab}/setup.log 2>&1 < /dev/null; sleep 1")
+    off, idle = 0, 0
+    while True:
+        time.sleep(4)
+        # the VM reports the file size, so the offset stays right however the terminal mangles line ends
+        _, out = remote.run(f"S=$(stat -c %s {lab}/setup.log 2>/dev/null || echo 0); "
+                            f"tail -c +{off + 1} {lab}/setup.log 2>/dev/null | head -c $((S-{off})); "
+                            f"R=$(pgrep -f 'mindlab/[s]etup_vm.sh|mindlab/[s]tart_server.sh' >/dev/null && echo run || echo idle); "
+                            f"echo; echo __MINDLAB__ $S $R $(cat {lab}/deploy.rc 2>/dev/null)")
+        body, _, tail = out.rpartition("__MINDLAB__ ")
+        parts = tail.split()
+        size = int(parts[0]) if parts and parts[0].isdigit() else off
+        state = parts[1] if len(parts) > 1 else "run"
+        rc = parts[2] if len(parts) > 2 else ""
+        body = body.replace("\r\n", "\n").rstrip("\n")
+        if size > off and body:
+            print(body, flush=True)
+        off = max(off, size)
+        if rc:
+            return int(rc) if rc.isdigit() else 1
+        idle = idle + 1 if state == "idle" else 0
+        if idle >= 4:     # nothing running on the VM and no result: the background job died
+            warn("instalacja na VM przestała działać bez wyniku (log powyżej)")
+            return 1
+
+
 def upload(ssh, cfg, vm_id):
     sftp = ssh.open_sftp()
     home = run(ssh, "echo $HOME", show=False)[1].strip()
@@ -547,15 +602,15 @@ def cmd_up(hs, cfg, keep=False, detach=False):
         say(f"VM działa: {ip}. Łączę przez SSH…")
         ssh = ssh_connect(cfg, ip)
         lab = upload(ssh, cfg, vm_id)
+        remote = Remote(cfg, ip, ssh)
         if cfg["WATCHDOG"] == "1" and cfg["END_ACTION"] != "keep":
-            run(ssh, f"pkill -f mindlab/watchdog.py; nohup python3 {lab}/watchdog.py > {lab}/watchdog.log 2>&1 &", show=False)
+            remote.run(f"pkill -f mindlab/watchdog.py; nohup python3 {lab}/watchdog.py > {lab}/watchdog.log 2>&1 &")
             say(f"strażnik na VM: {cfg['END_ACTION']} po {cfg['IDLE_MINUTES']} min bezczynności"
                 + (f" lub po {cfg['MAX_HOURS']} h" if float(cfg['MAX_HOURS'] or 0) > 0 else ""))
         say("instaluję środowisko i pobieram model (pierwszy raz: kilka-kilkanaście minut)…")
-        code, _ = run(ssh, f"bash {lab}/setup_vm.sh 2>&1 | tee {lab}/setup.log; exit ${{PIPESTATUS[0]}}")
-        if code != 0:
+        say("instalacja działa na VM w tle - przerwa w internecie albo uśpienie laptopa jej nie zatrzyma")
+        if deploy_on_vm(remote, lab) != 0:
             raise RuntimeError("instalacja na VM nie powiodła się (szczegóły powyżej)")
-        run(ssh, f"bash {lab}/start_server.sh")
         if not detach:
             port = free_port(int(cfg["LOCAL_PORT"]))
             tunnel = subprocess.Popen(ssh_base(cfg, ip)[:-1] + ["-N", "-L", f"{port}:127.0.0.1:8000", ssh_base(cfg, ip)[-1]])
@@ -563,7 +618,7 @@ def cmd_up(hs, cfg, keep=False, detach=False):
         say("czekam, aż model się załaduje…")
         last = ""
         while True:
-            code, out = run(ssh, "curl -s 127.0.0.1:8000/api/health || true", show=False)
+            code, out = remote.run("curl -s 127.0.0.1:8000/api/health || true")
             try:
                 health = json.loads(out.strip().splitlines()[-1]) if out.strip() else {}
             except (ValueError, IndexError):
@@ -571,7 +626,7 @@ def cmd_up(hs, cfg, keep=False, detach=False):
             if health.get("status") == "ready":
                 break
             if health.get("status") == "error":
-                run(ssh, f"tail -n 40 {lab}/server.log")
+                remote.run(f"tail -n 40 {lab}/server.log", show=True)
                 raise RuntimeError("serwer zgłosił błąd ładowania modelu (log powyżej; dashboard też go pokaże)")
             prog = health.get("progress")
             if prog and prog != last:
@@ -610,12 +665,14 @@ def cmd_up(hs, cfg, keep=False, detach=False):
         if tunnel:
             tunnel.terminate()
         warn(f"Problem: {e}")
-        choice = "h"
+        # public mode: the old server may still be serving users - keep the VM unless told otherwise
+        # (the watchdog still hibernates it when nobody uses it)
+        choice = "z" if detach else "h"
         if sys.stdin.isatty():
             try:
-                choice = input("Co zrobić z VM? [h]ibernuj / [d]usuń / [z]ostaw do debugowania (domyślnie h): ").strip().lower() or "h"
+                choice = input(f"Co zrobić z VM? [h]ibernuj / [d]usuń / [z]ostaw do debugowania (domyślnie {choice}): ").strip().lower() or choice
             except (EOFError, KeyboardInterrupt):
-                choice = "h"
+                pass                     # keep the default chosen above
         finish(hs, cfg, vm_id, {"d": "delete", "z": "keep"}.get(choice[:1], "hibernate"))
         if choice.startswith("z"):
             say(f"Debugowanie: python lab.py ssh   (logi: ~/mindlab/setup.log, ~/mindlab/server.log)")
