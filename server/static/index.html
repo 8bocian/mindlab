@@ -359,6 +359,13 @@ function renderSteerBadge(){
   $("bSteer").textContent = a.length ? `wstrzykiwanie: ${steerSummary(a)} · ${MODE_LABEL[steerMode()]} (${S.lastSites} miejsc)` : "wstrzykiwanie: wył.";
   $("bSteer").classList.toggle("on", a.length>0);
 }
+const siteLabel = s => (S.info && S.info.looped) ? `L${s.l}·p${s.p+1}` : `L${s.l}`;
+function syncRange(){
+  let lo=+$("lo").value, hi=+$("hi").value;
+  if(lo>hi){ [lo,hi]=[hi,lo]; }
+  $("loV").textContent=lo; $("hiV").textContent=hi;
+}
+
 // ---------- concepts ----------
 function addConceptRow(rep){
   const name = rep.name, gap = rep.best_gap;
