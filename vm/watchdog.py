@@ -2,7 +2,7 @@
 """
 Runs ON THE VM (stdlib only). Hibernates or deletes this VM via the Hyperstack API when:
   * nobody used the dashboard / setup for IDLE_MINUTES, or
-  * the VM has been up for more than MAX_HOURS.
+  * the VM has been up for more than MAX_HOURS (0 = no limit).
 This protects you if your laptop sleeps or loses connection while the VM is running.
 Runs as a systemd service, so it starts on every boot (also after restoring from hibernation in the
 Hyperstack panel). Both timers count from this process's start, never from an earlier session.
@@ -57,7 +57,7 @@ def main():
         reason = None
         if idle > idle_s:
             reason = f"bezczynność {idle/60:.0f} min"
-        elif up > max_s:
+        elif max_s > 0 and up > max_s:   # MAX_HOURS=0 -> no total time limit, idle limit only
             reason = f"przekroczono limit {max_s/3600:.1f} h"
         if reason:
             print(f"{time.ctime()}: {reason} -> {action}", flush=True)

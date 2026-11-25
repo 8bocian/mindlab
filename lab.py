@@ -480,7 +480,8 @@ def cmd_up(hs, cfg, keep=False, detach=False):
         lab = upload(ssh, cfg, vm_id)
         if cfg["WATCHDOG"] == "1" and cfg["END_ACTION"] != "keep":
             run(ssh, f"pkill -f mindlab/watchdog.py; nohup python3 {lab}/watchdog.py > {lab}/watchdog.log 2>&1 &", show=False)
-            say(f"strażnik na VM: {cfg['END_ACTION']} po {cfg['IDLE_MINUTES']} min bezczynności lub po {cfg['MAX_HOURS']} h")
+            say(f"strażnik na VM: {cfg['END_ACTION']} po {cfg['IDLE_MINUTES']} min bezczynności"
+                + (f" lub po {cfg['MAX_HOURS']} h" if float(cfg['MAX_HOURS'] or 0) > 0 else ""))
         say("instaluję środowisko i pobieram model (pierwszy raz: kilka-kilkanaście minut)…")
         code, _ = run(ssh, f"bash {lab}/setup_vm.sh 2>&1 | tee {lab}/setup.log; exit ${{PIPESTATUS[0]}}")
         if code != 0:
@@ -516,7 +517,8 @@ def cmd_up(hs, cfg, keep=False, detach=False):
             say("Od teraz włączasz i wyłączasz VM w panelu Hyperstack: Hibernate / Restore (NIE Stop - "
                 "zatrzymana VM nalicza pełną stawkę). Serwer i tunel wstają same po każdym starcie.", "32")
             warn(f"VM nalicza pełną stawkę, dopóki jej nie zahibernujesz (panel albo: python lab.py hibernate).\n"
-                 f"   Strażnik i tak ją zahibernuje po {cfg['IDLE_MINUTES']} min bez aktywności lub po {cfg['MAX_HOURS']} h.")
+                 f"   Strażnik i tak ją zahibernuje po {cfg['IDLE_MINUTES']} min bez aktywności"
+                 + (f" lub po {cfg['MAX_HOURS']} h." if float(cfg['MAX_HOURS'] or 0) > 0 else "."))
             return
         say(f"GOTOWE → {url}   (Ctrl+C kończy sesję i wykonuje: {'keep' if keep else cfg['END_ACTION']})", "32")
         webbrowser.open(url)
